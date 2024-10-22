@@ -151,6 +151,7 @@ class LlavaMetaModel:
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
+        
         if not hasattr(self.config, 'add_faster_video'):
             if model_args.add_faster_video:
                 embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
@@ -236,8 +237,8 @@ class LlavaMetaForCausalLM(ABC):
         elif self.config.mm_spatial_pool_mode == "max":
             image_feature = nn.functional.max_pool2d(image_feature, stride)
         elif self.config.mm_spatial_pool_mode == "bilinear":
-            height, weight = image_feature.shape[2:]
-            scaled_shape = [math.ceil(height / stride), math.ceil(weight / stride)]
+            height, width = image_feature.shape[2:]
+            scaled_shape = [math.ceil(height / stride), math.ceil(width / stride)]
             image_feature = nn.functional.interpolate(image_feature, size=scaled_shape, mode='bilinear')
 
         else:
@@ -308,6 +309,10 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
 
+        if isinstance(modalities, str):
+            modalities = [modalities]
+
+        # import pdb; pdb.set_trace()
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
@@ -360,12 +365,13 @@ class LlavaMetaForCausalLM(ABC):
                     # currently image_feature is a tensor of shape (4, num_patches, hidden_size)
                     # we want to first unflatten it to (2, 2, h, w, hidden_size)
                     # rank0_print("At least we are reaching here")
+                    # import pdb; pdb.set_trace()
                     if image_idx in video_idx_in_batch:  # video operations
                         # rank0_print("Video")
                         if mm_newline_position == "grid":
                             # Grid-wise
                             image_feature = self.add_token_per_grid(image_feature)
-                            if self.config.add_faster_video:
+                            if getattr(self.config, "add_faster_video", False):
                                 faster_video_feature = self.add_token_per_grid(all_faster_video_features[image_idx])
                                 # Add a token for each frame
                                 concat_slow_fater_token = []
