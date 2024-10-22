@@ -30,6 +30,64 @@ from llava.mm_utils import get_anyres_image_grid_shape
 from llava.utils import rank0_print, rank_print
 import random
 
+def measure_cpu_and_cuda_time(func, *args, **kwargs):
+    """
+    Measures the CPU and CUDA execution time of a function.
+
+    Args:
+        func (callable): The function to measure.
+        *args: Arguments to pass to the function.
+        **kwargs: Keyword arguments to pass to the function.
+
+    Returns:
+        result: The result of the function call.
+        cpu_time_ms (float): The CPU time taken in milliseconds.
+        cuda_time_ms (float): The CUDA time taken in milliseconds (only if using CUDA).
+    """
+    
+    # Measure CPU time using the time module
+    cpu_start_time = time.time()  # Start CPU timer
+
+    if torch.cuda.is_available():  # If CUDA is available, measure GPU time
+        # Create CUDA events for timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        # Synchronize CUDA and record the start event
+        torch.cuda.synchronize()
+        start_event.record()
+
+        # Run the function
+        result = func(*args, **kwargs)
+
+        # Record the end event and synchronize
+        end_event.record()
+        torch.cuda.synchronize()
+
+        # Measure CUDA elapsed time in milliseconds
+        cuda_time_ms = start_event.elapsed_time(end_event)
+    else:
+        # If CUDA is not available, simply run the function
+        result = func(*args, **kwargs)
+        cuda_time_ms = None
+
+    # Measure CPU end time
+    cpu_end_time = time.time()
+    cpu_time_ms = (cpu_end_time - cpu_start_time) * 1000  # Convert to milliseconds
+
+    return result, cpu_time_ms, cuda_time_ms
+
+# Example usage:
+# def my_function(input_tensor):
+#     return input_tensor * 2  # Example function
+
+# input_data = torch.randn(1000, 1000, device="cuda" if torch.cuda.is_available() else "cpu")
+# result, cpu_time, cuda_time = measure_cpu_and_cuda_time(my_function, input_data)
+
+# print(f"CPU Time: {cpu_time:.3f} ms")
+# if cuda_time is not None:
+#     print(f"CUDA Time: {cuda_time:.3f} ms")
+
 
 class LlavaMetaModel:
 
@@ -228,16 +286,13 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.flatten(1, 2).flatten(2, 3)
         image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         if self.config.add_faster_video:
-            # import pdb; pdb.set_trace()
             # (3584, 832, 14) -> (3584, 64, 13, 14)
             image_feature = image_feature.view(feature_dim, num_frames,resize_h, -1)
             #  (3584, 64, 13, 14) -> (64, 13, 14, 3584)
             image_feature = image_feature.permute(1, 2, 3, 0).contiguous()
             # (64, 13, 14, 3584) -> (64, 13*14, 3584)
             image_feature = image_feature.flatten(1, 2)
-            # import pdb; pdb.set_trace()
             return image_feature
-        # import pdb; pdb.set_trace()
         image_feature = image_feature.flatten(1, 2).transpose(0, 1)
         return image_feature
 
@@ -251,7 +306,7 @@ class LlavaMetaForCausalLM(ABC):
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels
+            return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
@@ -271,7 +326,11 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
+            # import pdb; pdb.set_trace()
+
             encoded_image_features = self.encode_images(concat_images)
+            
+            # bhavika: The actual image encoding is happening here
             # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
@@ -346,6 +405,7 @@ class LlavaMetaForCausalLM(ABC):
                         base_image_feature = image_feature[0]
                         image_feature = image_feature[1:]
                         height = width = self.get_vision_tower().num_patches_per_side
+                        # import pdb; pdb.set_trace()
                         assert height * width == base_image_feature.shape[0]
 
                         if "anyres_max" in image_aspect_ratio:
@@ -438,7 +498,9 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = []
+        token_indices = []
         cur_image_idx = 0
+
         # rank_print("Inserting Images embedding")
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
@@ -465,26 +527,30 @@ class LlavaMetaForCausalLM(ABC):
             cur_new_input_embeds = []
             cur_new_labels = []
 
+            curr_token_indices = []
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
+                curr_token_indices.append(cur_input_embeds_no_im[i].shape[0])
                 if i < num_images:
                     try:
                         cur_image_features = image_features[cur_image_idx]
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
+                    curr_token_indices.append(cur_image_features.shape[0])
+                    # num_tokens += image_features[cur_image_idx].shape[0]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
-            # import pdb; pdb.set_trace()
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
+            token_indices.append(curr_token_indices)
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
@@ -544,9 +610,8 @@ class LlavaMetaForCausalLM(ABC):
             right_add = random.randint(left_add, self.config.pos_skipping_range)
             position_ids[:, :split_position] += left_add
             position_ids[:, split_position:] += right_add
-        # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, token_indices
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
