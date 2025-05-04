@@ -30,6 +30,8 @@ from transformers import PretrainedConfig
 from transformers.utils import ModelOutput
 from llava.utils import rank0_print
 
+from transformers import SiglipModel, SiglipProcessor
+
 
 class SigLipImageProcessor:
     def __init__(self, image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5), size=(384, 384), crop_size: Dict[str, int] = None, resample=PILImageResampling.BICUBIC, rescale_factor=1 / 255, data_format=ChannelDimension.FIRST):
@@ -533,6 +535,121 @@ class SigLipVisionModel(SigLipPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+    
+class SigLipMultiModalEncoder(nn.Module):
+    def __init__(self, model_name, delay_load=False):
+        super().__init__()
+        self.model_name = model_name
+        if not delay_load:
+            self.load_model()
+    
+    def load_model(self, device_map='cuda'):
+        """Load the SigLip model and processor"""
+        self.model = SiglipModel.from_pretrained(
+            self.model_name,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.float16,
+            device_map=device_map,
+        )
+        self.processor = SiglipProcessor.from_pretrained(self.model_name)
+        # Store normalization parameters for direct tensor processing
+        self.image_mean = torch.tensor(self.processor.image_processor.image_mean).view(1, 3, 1, 1)
+        self.image_std = torch.tensor(self.processor.image_processor.image_std).view(1, 3, 1, 1)
+        self.target_size = (
+            self.processor.image_processor.size["height"], 
+            self.processor.image_processor.size["width"]
+        )
+        
+    def prepare_images(self, images, device):
+        """Process image tensors directly without PIL conversion"""
+        # Ensure images are in the right format [batch, channels, height, width]
+        if images.dim() == 3:  # Single image [channels, height, width]
+            images = images.unsqueeze(0)
+            
+        # Resize if needed
+        current_size = images.shape[2:4]
+        if current_size != self.target_size:
+            images = torch.nn.functional.interpolate(
+                images, 
+                size=self.target_size, 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        # Apply normalization directly
+        self.image_mean = self.image_mean.to(device)
+        self.image_std = self.image_std.to(device)
+        
+        # Check if normalization is needed (normalize from [0,1] or [-1,1] to model's expected range)
+        if images.min() < 0 or images.max() > 1:
+            # Assuming images are in range [-1, 1], convert to [0, 1]
+            images = (images + 1) / 2
+            
+        # Apply model's normalization
+        images = (images - self.image_mean) / self.image_std
+        
+        return images
+    
+    def prepare_text(self, text, device):
+        """Process text input"""
+        if isinstance(text, str):
+            text = [text]  # Convert single string to list for batch processing
+            
+        text_inputs = self.processor.tokenizer(
+            text, 
+            padding="max_length", 
+            max_length=self.processor.tokenizer.model_max_length, 
+            truncation=True,
+            return_tensors="pt"
+        ).to(device)
+        
+        return text_inputs
+    
+    def encode_input(self, images, text, device_map='cuda'):
+        """
+        Calculate cosine similarity between image and text embeddings
+        
+        Args:
+            images: Tensor of shape [batch, 3, height, width]
+            text: String or list of strings
+            device_map: Device to run the model on
+        
+        Returns:
+            Tensor of cosine similarity scores
+        """
+        device = torch.device(device_map)
+        
+        # Process images directly as tensors
+        processed_images = self.prepare_images(images, device)
+        
+        # Process text
+        text_inputs = self.prepare_text(text, device)
+        
+        # Create model inputs
+        inputs = {
+            "pixel_values": processed_images,
+            "input_ids": text_inputs.input_ids,
+        }
+
+        # Add attention_mask if it exists
+        if "attention_mask" in text_inputs:
+            inputs["attention_mask"] = text_inputs["attention_mask"]
+        
+        # Run model inference
+        with torch.no_grad():
+            with torch.autocast(device_map):
+                outputs = self.model(**inputs)
+                
+        # Extract image and text embeddings from the model outputs
+        image_embeds = outputs.vision_model_output.pooler_output
+        text_embeds = outputs.text_model_output.pooler_output
+        
+        # Calculate cosine similarity
+        # Normalize embeddings
+        image_embeds = image_embeds / image_embeds.norm(dim=1, keepdim=True)
+        text_embeds = text_embeds / text_embeds.norm(dim=1, keepdim=True)
+        
+        return image_embeds, text_embeds
 
 
 class SigLipVisionTower(nn.Module):

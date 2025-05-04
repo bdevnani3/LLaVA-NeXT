@@ -29,8 +29,9 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 from llava.mm_utils import get_anyres_image_grid_shape
 from llava.utils import rank0_print, rank_print
 import random
-
-
+from einops import rearrange
+from .utils import get_n_most_interesting_frames, pick_non_overlapping_integers
+import numpy as np
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -41,9 +42,15 @@ class LlavaMetaModel:
             self.vision_tower = build_vision_tower(config, delay_load=delay_load)
             self.vision_resampler = build_vision_resampler(config, vision_tower=self.vision_tower)
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
+            self.multimodal_encoder = None
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+
+    def get_multimodal_encoder(self):
+        if self.multimodal_encoder is None:
+            self.multimodal_encoder = build_vision_tower(self.config, load_vision_and_text_filter=True)
+        return self.multimodal_encoder
 
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
@@ -168,7 +175,10 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def get_2dPool(self, image_feature, stride=2):
+    def get_multimodal_encoder(self):
+        return self.get_model().get_multimodal_encoder()
+
+    def get_2dPool(self, image_feature, stride=2, im_resize_shape=None):
         height = width = self.get_vision_tower().num_patches_per_side
         num_frames, num_tokens, num_dim = image_feature.shape
         image_feature = image_feature.view(num_frames, height, width, -1)
@@ -181,6 +191,8 @@ class LlavaMetaForCausalLM(ABC):
         elif self.config.mm_spatial_pool_mode == "bilinear":
             height, width = image_feature.shape[2:]
             scaled_shape = [math.ceil(height / stride), math.ceil(width / stride)]
+            if im_resize_shape is not None:
+                scaled_shape = [im_resize_shape, im_resize_shape]
             image_feature = nn.functional.interpolate(image_feature, size=scaled_shape, mode='bilinear')
 
         else:
@@ -247,8 +259,183 @@ class LlavaMetaForCausalLM(ABC):
         image_feature =  torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
+    
+    def temporal_aggregation(self, image_features, temporal_aggregation):
+        T, N, D = image_features.shape
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
+        if temporal_aggregation == "concat":
+            ## temporal cat
+            image_features = image_features.reshape(T * N, D)
+        elif temporal_aggregation == "spatial_1d_max_pool":
+            ## horizontal max pool + temporal cat
+            pool2 = nn.MaxPool1d(kernel_size=2, stride=2)
+            image_features = rearrange(image_features, 't n d -> t d n')
+            image_features = pool2(image_features)
+            image_features = rearrange(image_features, 't d n -> t n d', t=T)
+            image_features = image_features.reshape(-1, D)
+        elif temporal_aggregation == "spatial_1d_avg_pool":
+            ## horizontal avg pool + temporal cat
+            pool2 = nn.AvgPool1d(kernel_size=2, stride=2)
+            image_features = rearrange(image_features, 't n d -> t d n')
+            image_features = pool2(image_features)
+            image_features = rearrange(image_features, 't d n -> t n d', t=T)
+            image_features = image_features.reshape(-1, D)
+        elif temporal_aggregation == "spatial_2d_max_pool":
+            ## spatial max pool + temporal cat
+            n0 = n1 = int(math.sqrt(N))
+            pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+            image_features = rearrange(image_features, 't (n0 n1) d -> d t n0 n1', n0=n0, n1=n1)
+            image_features = pool2(image_features)
+            image_features = rearrange(image_features, 'd t n0 n1 -> (t n0 n1) d')
+        elif temporal_aggregation == "spatial_2d_avg_pool":
+            ## spatial avg pool + temporal cat
+            n0 = n1 = int(math.sqrt(N))
+            pool2 = nn.AvgPool2d(kernel_size=2, stride=2)
+            image_features = rearrange(image_features, 't (n0 n1) d -> d t n0 n1', n0=n0, n1=n1)
+            image_features = pool2(image_features)
+            image_features = rearrange(image_features, 'd t n0 n1 -> (t n0 n1) d')
+        elif temporal_aggregation == "spatial_temporal_pool":
+            ## spatial pool + temporal pool
+            pooling_size = (16, 12, 12)
+            n0 = n1 = int(math.sqrt(N))
+            pool3 = nn.AdaptiveAvgPool3d(pooling_size)
+            image_features = rearrange(image_features, 't (n0 n1) d -> d t n0 n1', n0=n0, n1=n1)
+            image_features = pool3(image_features)
+            image_features = rearrange(image_features, 'd t n0 n1 -> (t n0 n1) d')
+        elif temporal_aggregation == "temporal_global_pool":
+            ## temporal pool
+            image_features = torch.mean(image_features, dim=0)
+        else:
+            raise ValueError(f'Unknown temporal aggregation method: {temporal_aggregation}')
+
+        image_features = image_features.unsqueeze(0)
+        return image_features
+    
+    def prepare_slowfast(self, image_features, temporal_aggregation):
+
+        T, N, D = image_features.shape
+        # Example: temporal_aggregation = "slowfast-slow_10frms_spatial_1d_max_pool-fast_4x4"
+        slowfast_match = re.match(r'^slowfast-slow_(\d+)frms_(\w+)-fast_(\d+)x(\d+)_(\d+)frms$', temporal_aggregation)
+        if not slowfast_match:
+            raise ValueError(f'Failed to parse the temporal aggregation for slowfast: {temporal_aggregation}')
+        num_slowpath = int(slowfast_match.group(1))
+        slowpath_temporal_aggregation = slowfast_match.group(2)
+        fastpath_output_size = (
+            int(slowfast_match.group(3)),
+            int(slowfast_match.group(4)),
+        )
+        num_fast_frames = int(slowfast_match.group(5))
+
+        # Prepare slow pathway
+        slowpath_idx = torch.linspace(0, T, num_slowpath + 1)
+        slowpath_idx = slowpath_idx.to(torch.int32).tolist()
+        slowpath_idx.pop()
+
+        slowpath_features = self.temporal_aggregation(
+            image_features[slowpath_idx],
+            slowpath_temporal_aggregation,
+        )
+
+        # Prepare fast pathway
+        fastpath_features = image_features  # [T N D]
+
+        if T > num_fast_frames:
+            indices = torch.linspace(0, T-1, num_fast_frames).long()
+            fastpath_features = fastpath_features[indices]
+
+        pool2 = nn.AdaptiveAvgPool2d(fastpath_output_size)
+        n0 = n1 = int(math.sqrt(N))
+        fastpath_features = rearrange(fastpath_features, 't (n0 n1) d -> d t n0 n1', n0=n0, n1=n1)  # [T N D] -> [D T N0 N1]
+        fastpath_features = pool2(fastpath_features)
+        fastpath_features = rearrange(fastpath_features, 'd t n0 n1 -> (t n0 n1) d')  # [D T N0/2 N1/2] -> [-1 D]
+        fastpath_features = fastpath_features.unsqueeze(0)
+
+        slowfast_features = torch.cat((slowpath_features, fastpath_features), dim=1)
+        return slowfast_features
+    
+    def run_clip_similarity_cache(self, cache_clip_similarity, images, kwargs):
+        import pdb; pdb.set_trace()
+        multimodal_encoder = self.get_multimodal_encoder()
+        text_query = [kwargs["text_prompt"]]
+        text_query = [text_query[0].replace("Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option.\n", "")]
+
+        batched_doc_id = kwargs["batched_doc_id"]
+
+        # For cross similarity scores at different resolutions
+        cross_similarity_scores = {}
+        resolutions = [1, 2, 4, 8, 16]
+        for res in resolutions:
+            cross_similarity_scores[res] = []
+
+        # For image similarity scores at different resolutions
+        image_similarity_scores = {}
+        for res in resolutions:
+            image_similarity_scores[res] = []
+        
+        # Keep track of previous embeddings for each resolution
+        previous_embeddings = {}
+        for res in resolutions:
+            # Need to keep res previous embeddings for each resolution
+            previous_embeddings[res] = []
+        
+        # Process images in batches
+        for i in range(0, images.shape[0], 100):
+            batch_images = images[i:i+100]
+            curr_image_embeds, curr_text_embeds = multimodal_encoder.encode_input(batch_images, text_query)
+            
+            # Calculate cross-similarity for each resolution
+            for res in resolutions:
+                # For cross similarity, we want every res-th frame
+                sampled_indices = list(range(0, curr_image_embeds.shape[0], res))
+                if sampled_indices:  # If we have any frames at this resolution
+                    sampled_embeds = curr_image_embeds[sampled_indices]
+                    cross_sim = torch.matmul(sampled_embeds, curr_text_embeds.T).cpu().numpy()
+                    cross_similarity_scores[res].append(cross_sim)
+            
+            # Calculate image similarity for each resolution
+            for res in resolutions:
+                # Add current batch embeddings to previous embeddings
+                all_embeds = previous_embeddings[res] + [curr_image_embeds[j] for j in range(curr_image_embeds.shape[0])]
+                
+                # Calculate similarities for pairs res distance apart
+                for j in range(len(all_embeds) - res):
+                    sim = torch.sum(all_embeds[j] * all_embeds[j+res]).item()
+                    image_similarity_scores[res].append(sim)
+                
+                # Update previous embeddings for next batch
+                # Keep only the embeddings we need for the next batch
+                previous_embeddings[res] = all_embeds[-res:] if len(all_embeds) >= res else all_embeds
+        
+        # Convert lists to numpy arrays
+        for res in resolutions:
+            if cross_similarity_scores[res]:
+                cross_similarity_scores[res] = np.concatenate(cross_similarity_scores[res], axis=0)
+            else:
+                cross_similarity_scores[res] = np.array([])
+                
+            image_similarity_scores[res] = np.array(image_similarity_scores[res])
+        
+        # Create directories if they don't exist
+        import os
+        for res in resolutions:
+            os.makedirs(f"{cache_clip_similarity}/image_sim_{res}", exist_ok=True)
+            os.makedirs(f"{cache_clip_similarity}/cross_sim_{res}", exist_ok=True)
+        
+        # Save all similarity scores to compressed NPZ files
+        for res in resolutions:
+            np.savez_compressed(f"{cache_clip_similarity}/image_sim_{res}/{batched_doc_id}.npz", 
+                            data=image_similarity_scores[res])
+            np.savez_compressed(f"{cache_clip_similarity}/cross_sim_{res}/{batched_doc_id}.npz", 
+                            data=cross_similarity_scores[res])
+        import pdb; pdb.set_trace()
+        print(f"Finished creating similarity caches for {batched_doc_id} at resolutions {resolutions}")
+
+    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, **kwargs):
+        
+        slowfast_temporal_aggregation = kwargs.get("slowfast_temporal_aggregation", None)
+        im_resize_shape = kwargs.get("im_resize_shape", None)
+        cache_clip_similarity = kwargs.get("cache_clip_similarity", None)
+
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -276,7 +463,39 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
-            encoded_image_features = self.encode_images(concat_images)
+            # encoded_image_features = self.encode_images(concat_images)
+
+            if cache_clip_similarity is not None:
+                self.run_clip_similarity_cache(cache_clip_similarity, concat_images, kwargs)
+                # Hack to return None to skip the rest of the function
+                return None
+
+            # Temporary expt - TODO: Remove this
+            goal_num_frames = 32
+            if concat_images.shape[0] > goal_num_frames:
+                doc_id = kwargs.get("batched_doc_id", None)
+                if doc_id is not None:
+                    key_frames = get_n_most_interesting_frames(doc_id, goal_num_frames, concat_images.shape[0], kwargs.get("task_type", None))
+
+                    if len(key_frames) > goal_num_frames // 2:
+                        key_frames = key_frames[:goal_num_frames // 2]
+
+                    # uniformly sample the remaining frames
+                    remaining_indices = goal_num_frames - len(key_frames)
+                    remaining_indices = torch.linspace(0, concat_images.shape[0]-1, remaining_indices).long()
+                    key_frames = torch.tensor(key_frames).long()
+                    key_frames = torch.cat((key_frames, remaining_indices))
+                    key_frames, _ = torch.sort(key_frames)
+
+                    concat_images = concat_images[key_frames, ...]
+                    split_sizes = [goal_num_frames]
+
+
+            encoded_image_features = []
+            for i in range(0, concat_images.shape[0], 100):
+                encoded_image_features.append(self.encode_images(concat_images[i:i+100]))
+            encoded_image_features = torch.cat(encoded_image_features, dim=0)
+
             # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
@@ -285,7 +504,7 @@ class LlavaMetaForCausalLM(ABC):
             image_features = []
             for idx, image_feat in enumerate(encoded_image_features):
                 if idx in video_idx_in_batch:
-                    image_features.append(self.get_2dPool(image_feat))
+                    image_features.append(self.get_2dPool(image_feat, im_resize_shape=im_resize_shape))
                 else:
                     image_features.append(image_feat)
             # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
@@ -336,7 +555,10 @@ class LlavaMetaForCausalLM(ABC):
                             
                         elif mm_newline_position == "one_token":
                             # one-token
-                            image_feature = image_feature.flatten(0, 1)
+                            if slowfast_temporal_aggregation != None:
+                                image_feature = self.prepare_slowfast(image_feature, slowfast_temporal_aggregation).squeeze(0)
+                            else:
+                                image_feature = image_feature.flatten(0, 1)
                             if 'unpad' in mm_patch_merge_type:
                                 image_feature = torch.cat((
                                     image_feature,
