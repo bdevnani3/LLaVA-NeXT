@@ -261,6 +261,7 @@ class LlavaMetaForCausalLM(ABC):
         return image_feature
     
     def temporal_aggregation(self, image_features, temporal_aggregation):
+        import pdb; pdb.set_trace()
         T, N, D = image_features.shape
 
         if temporal_aggregation == "concat":
@@ -357,7 +358,15 @@ class LlavaMetaForCausalLM(ABC):
         # import pdb; pdb.set_trace()
         multimodal_encoder = self.get_multimodal_encoder()
         text_query = [kwargs["text_prompt"]]
-        text_query = [text_query[0].replace("Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option.\n", "")]
+
+        phrases_to_remove = ["Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option.\n", 
+                             "Answer with the option's letter from the given choices directly.",
+                             "\nOnly give the best option.\nBest option: (",
+                             "\nOnly give the best option.",
+                             "Please directly give the best option:",
+                             "Please answer yes or no:"]
+        for phrase in phrases_to_remove:
+            text_query = [text_query[0].replace(phrase, "")]
 
         batched_doc_id = kwargs["batched_doc_id"]
 
@@ -396,7 +405,7 @@ class LlavaMetaForCausalLM(ABC):
             np.savez_compressed(f"{cache_clip_similarity}/cross_sim_{skip_factor}/{batched_doc_id}.npz", 
                                 data=cross_sim)
         
-            print(f"Finished creating similarity caches for element <{batched_doc_id}> at resolution {skip_factor}")
+        print(f"Finished creating similarity caches for element <{batched_doc_id}>")
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, **kwargs):
         

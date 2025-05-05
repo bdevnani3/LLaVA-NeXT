@@ -138,6 +138,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         _ = kwargs.pop("max_frames_num", None)
         _ = kwargs.pop("batched_doc_id", None)
         _ = kwargs.pop("task_type", None)
+        _ = kwargs.pop("text_prompt", None)
         cache_clip_similarity = kwargs.pop("cache_clip_similarity", None)
         if cache_clip_similarity is not None:
             return None
