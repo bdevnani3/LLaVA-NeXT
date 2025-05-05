@@ -354,81 +354,49 @@ class LlavaMetaForCausalLM(ABC):
         return slowfast_features
     
     def run_clip_similarity_cache(self, cache_clip_similarity, images, kwargs):
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         multimodal_encoder = self.get_multimodal_encoder()
         text_query = [kwargs["text_prompt"]]
         text_query = [text_query[0].replace("Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option.\n", "")]
 
         batched_doc_id = kwargs["batched_doc_id"]
 
-        # For cross similarity scores at different resolutions
-        cross_similarity_scores = {}
-        resolutions = [1, 2, 4, 8, 16]
-        for res in resolutions:
-            cross_similarity_scores[res] = []
-
-        # For image similarity scores at different resolutions
-        image_similarity_scores = {}
-        for res in resolutions:
-            image_similarity_scores[res] = []
+        skip_factors = [1, 2, 4, 8, 16, 32, 64]
         
-        # Keep track of previous embeddings for each resolution
-        previous_embeddings = {}
-        for res in resolutions:
-            # Need to keep res previous embeddings for each resolution
-            previous_embeddings[res] = []
+        all_image_embeds = []
+        all_text_embeds = []
         
         # Process images in batches
         for i in range(0, images.shape[0], 100):
             batch_images = images[i:i+100]
             curr_image_embeds, curr_text_embeds = multimodal_encoder.encode_input(batch_images, text_query)
-            
-            # Calculate cross-similarity for each resolution
-            for res in resolutions:
-                # For cross similarity, we want every res-th frame
-                sampled_indices = list(range(0, curr_image_embeds.shape[0], res))
-                if sampled_indices:  # If we have any frames at this resolution
-                    sampled_embeds = curr_image_embeds[sampled_indices]
-                    cross_sim = torch.matmul(sampled_embeds, curr_text_embeds.T).cpu().numpy()
-                    cross_similarity_scores[res].append(cross_sim)
-            
-            # Calculate image similarity for each resolution
-            for res in resolutions:
-                # Add current batch embeddings to previous embeddings
-                all_embeds = previous_embeddings[res] + [curr_image_embeds[j] for j in range(curr_image_embeds.shape[0])]
-                
-                # Calculate similarities for pairs res distance apart
-                for j in range(len(all_embeds) - res):
-                    sim = torch.sum(all_embeds[j] * all_embeds[j+res]).item()
-                    image_similarity_scores[res].append(sim)
-                
-                # Update previous embeddings for next batch
-                # Keep only the embeddings we need for the next batch
-                previous_embeddings[res] = all_embeds[-res:] if len(all_embeds) >= res else all_embeds
-        
-        # Convert lists to numpy arrays
-        for res in resolutions:
-            if cross_similarity_scores[res]:
-                cross_similarity_scores[res] = np.concatenate(cross_similarity_scores[res], axis=0)
-            else:
-                cross_similarity_scores[res] = np.array([])
-                
-            image_similarity_scores[res] = np.array(image_similarity_scores[res])
-        
-        # Create directories if they don't exist
+            all_image_embeds.append(curr_image_embeds)
+
+        all_image_embeds = torch.cat(all_image_embeds, dim=0)
+        all_text_embeds = torch.cat([curr_text_embeds], dim=0)[0,:].unsqueeze(0) # Just need one text embedding - all are the same
+
         import os
-        for res in resolutions:
-            os.makedirs(f"{cache_clip_similarity}/image_sim_{res}", exist_ok=True)
-            os.makedirs(f"{cache_clip_similarity}/cross_sim_{res}", exist_ok=True)
         
-        # Save all similarity scores to compressed NPZ files
-        for res in resolutions:
-            np.savez_compressed(f"{cache_clip_similarity}/image_sim_{res}/{batched_doc_id}.npz", 
-                            data=image_similarity_scores[res])
-            np.savez_compressed(f"{cache_clip_similarity}/cross_sim_{res}/{batched_doc_id}.npz", 
-                            data=cross_similarity_scores[res])
-        import pdb; pdb.set_trace()
-        print(f"Finished creating similarity caches for {batched_doc_id} at resolutions {resolutions}")
+        for skip_factor in skip_factors:
+            indices = list(range(0, all_image_embeds.shape[0], skip_factor))
+            curr_image_embeds = all_image_embeds[indices, :]
+
+            cross_sim = torch.matmul(curr_image_embeds, all_text_embeds.T).squeeze(-1).cpu().numpy()
+
+            # Calculate image similarity between adjacent frames
+            adjacent_matmul = torch.sum(curr_image_embeds[:-1] * curr_image_embeds[1:], dim=1).cpu().numpy()
+            # add a 0th element to the end of adjacent_matmul
+            adjacent_matmul = np.insert(adjacent_matmul, 0, 1)
+
+            os.makedirs(f"{cache_clip_similarity}/image_sim_{skip_factor}", exist_ok=True)
+            os.makedirs(f"{cache_clip_similarity}/cross_sim_{skip_factor}", exist_ok=True)
+
+            np.savez_compressed(f"{cache_clip_similarity}/image_sim_{skip_factor}/{batched_doc_id}.npz", 
+                                data=adjacent_matmul)
+            np.savez_compressed(f"{cache_clip_similarity}/cross_sim_{skip_factor}/{batched_doc_id}.npz", 
+                                data=cross_sim)
+        
+            print(f"Finished creating similarity caches for element <{batched_doc_id}> at resolution {skip_factor}")
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, **kwargs):
         
