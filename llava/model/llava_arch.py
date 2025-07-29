@@ -261,7 +261,6 @@ class LlavaMetaForCausalLM(ABC):
         return image_feature
     
     def temporal_aggregation(self, image_features, temporal_aggregation):
-        import pdb; pdb.set_trace()
         T, N, D = image_features.shape
 
         if temporal_aggregation == "concat":
@@ -355,8 +354,7 @@ class LlavaMetaForCausalLM(ABC):
         return slowfast_features
     
     def run_clip_similarity_cache(self, cache_clip_similarity, images, kwargs):
-        # import pdb; pdb.set_trace()
-        multimodal_encoder = self.get_multimodal_encoder()
+        multimodal_encoder = self.≈()
         text_query = [kwargs["text_prompt"]]
 
         phrases_to_remove = ["Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option.\n", 
@@ -378,11 +376,12 @@ class LlavaMetaForCausalLM(ABC):
         # Process images in batches
         for i in range(0, images.shape[0], 100):
             batch_images = images[i:i+100]
-            curr_image_embeds, curr_text_embeds = multimodal_encoder.encode_input(batch_images, text_query)
+            # curr_image_embeds, curr_text_embeds = multimodal_encoder.encode_input(batch_images, text_query)
+            curr_image_embeds = multimodal_encoder.encode_images(batch_images)
             all_image_embeds.append(curr_image_embeds)
 
         all_image_embeds = torch.cat(all_image_embeds, dim=0)
-        all_text_embeds = torch.cat([curr_text_embeds], dim=0)[0,:].unsqueeze(0) # Just need one text embedding - all are the same
+        # all_text_embeds = torch.cat([curr_text_embeds], dim=0)[0,:].unsqueeze(0) # Just need one text embedding - all are the same
 
         import os
         
@@ -390,7 +389,7 @@ class LlavaMetaForCausalLM(ABC):
             indices = list(range(0, all_image_embeds.shape[0], skip_factor))
             curr_image_embeds = all_image_embeds[indices, :]
 
-            cross_sim = torch.matmul(curr_image_embeds, all_text_embeds.T).squeeze(-1).cpu().numpy()
+            # cross_sim = torch.matmul(curr_image_embeds, all_text_embeds.T).squeeze(-1).cpu().numpy()
 
             # Calculate image similarity between adjacent frames
             adjacent_matmul = torch.sum(curr_image_embeds[:-1] * curr_image_embeds[1:], dim=1).cpu().numpy()
@@ -398,12 +397,12 @@ class LlavaMetaForCausalLM(ABC):
             adjacent_matmul = np.insert(adjacent_matmul, 0, 1)
 
             os.makedirs(f"{cache_clip_similarity}/image_sim_{skip_factor}", exist_ok=True)
-            os.makedirs(f"{cache_clip_similarity}/cross_sim_{skip_factor}", exist_ok=True)
+            # os.makedirs(f"{cache_clip_similarity}/cross_sim_{skip_factor}", exist_ok=True)
 
             np.savez_compressed(f"{cache_clip_similarity}/image_sim_{skip_factor}/{batched_doc_id}.npz", 
                                 data=adjacent_matmul)
-            np.savez_compressed(f"{cache_clip_similarity}/cross_sim_{skip_factor}/{batched_doc_id}.npz", 
-                                data=cross_sim)
+            # np.savez_compressed(f"{cache_clip_similarity}/cross_sim_{skip_factor}/{batched_doc_id}.npz", 
+            #                     data=cross_sim)
         
         print(f"Finished creating similarity caches for element <{batched_doc_id}>")
 
@@ -448,14 +447,24 @@ class LlavaMetaForCausalLM(ABC):
                 return None
 
             # Temporary expt - TODO: Remove this
-            goal_num_frames = 32
-            if concat_images.shape[0] > goal_num_frames:
+            goal_num_frames = int(kwargs.get("post_sampling_num_frames", 32))
+            if concat_images.shape[0] > goal_num_frames and (slowfast_temporal_aggregation is None):
+                adaptive_sampling_method_max_frames=int(kwargs.get("adaptive_sampling_method_max_frames", goal_num_frames))
+                # import pdb; pdb.set_trace()
                 doc_id = kwargs.get("batched_doc_id", None)
                 if doc_id is not None:
-                    key_frames = get_n_most_interesting_frames(doc_id, goal_num_frames, concat_images.shape[0], kwargs.get("task_type", None))
+                    key_frames = get_n_most_interesting_frames(doc_id, 
+                                                               goal_num_frames, 
+                                                               concat_images.shape[0], 
+                                                               kwargs.get("task_type", None),
+                                                               method=kwargs.get("adaptive_sampling_method", "text"),
+                                                               adaptive_sampling_method_max_frames=adaptive_sampling_method_max_frames,
+                                                               use_subclip_detection=kwargs.get("use_subclip_detection", False),
+                                                               use_aks=kwargs.get("use_aks", False),)
+                    # print(f"Key frames: {len(key_frames)}")
 
-                    if len(key_frames) > goal_num_frames // 2:
-                        key_frames = key_frames[:goal_num_frames // 2]
+                    if len(key_frames) > adaptive_sampling_method_max_frames:
+                        key_frames = key_frames[:adaptive_sampling_method_max_frames]
 
                     # uniformly sample the remaining frames
                     remaining_indices = goal_num_frames - len(key_frames)
@@ -467,11 +476,13 @@ class LlavaMetaForCausalLM(ABC):
                     concat_images = concat_images[key_frames, ...]
                     split_sizes = [goal_num_frames]
 
-
+            # print(concat_images.shape)
             encoded_image_features = []
             for i in range(0, concat_images.shape[0], 100):
                 encoded_image_features.append(self.encode_images(concat_images[i:i+100]))
             encoded_image_features = torch.cat(encoded_image_features, dim=0)
+
+            # print(f"Encoded image features shape: {encoded_image_features.shape}")
 
             # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 

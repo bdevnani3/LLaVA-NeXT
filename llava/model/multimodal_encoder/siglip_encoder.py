@@ -515,7 +515,7 @@ class SigLipVisionModel(SigLipPreTrainedModel):
         >>> import requests
         >>> from transformers import AutoProcessor, SigLipVisionModel
 
-        >>> model = SigLipVisionModel.from_pretrained("google/siglip-base-patch16-224")
+        >>> model = SigLipVisionModel.from_pretrained("xf-base-patch16-224")
         >>> processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
 
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
@@ -735,3 +735,395 @@ class SigLipVisionTower(nn.Module):
     @property
     def image_size(self):
         return self.config.image_size
+
+
+import torch
+import torch.nn as nn
+from transformers import CLIPModel, CLIPProcessor
+
+
+class CLIPMultiModalEncoder(nn.Module):
+    def __init__(self, model_name="openai/clip-vit-base-patch32", delay_load=False):
+        super().__init__()
+        self.model_name = model_name
+        if not delay_load:
+            self.load_model()
+    
+    def load_model(self, device_map='cuda'):
+        """Load the CLIP model and processor"""
+        self.model = CLIPModel.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.float16,
+            device_map=device_map,
+        )
+        self.processor = CLIPProcessor.from_pretrained(self.model_name)
+        
+        # Store normalization parameters for direct tensor processing
+        # CLIP uses different normalization values than SigLip
+        self.image_mean = torch.tensor(self.processor.image_processor.image_mean).view(1, 3, 1, 1)
+        self.image_std = torch.tensor(self.processor.image_processor.image_std).view(1, 3, 1, 1)
+        
+        # CLIP uses 'size' field differently - it's a single integer for square images
+        if isinstance(self.processor.image_processor.size, dict):
+            self.target_size = (
+                self.processor.image_processor.size["shortest_edge"], 
+                self.processor.image_processor.size["shortest_edge"]
+            )
+        else:
+            # CLIP typically uses square images
+            size = self.processor.image_processor.size
+            self.target_size = (size, size)
+        
+    def prepare_images(self, images, device):
+        """Process image tensors directly without PIL conversion"""
+        # Ensure images are in the right format [batch, channels, height, width]
+        if images.dim() == 3:  # Single image [channels, height, width]
+            images = images.unsqueeze(0)
+            
+        # Resize if needed
+        current_size = images.shape[2:4]
+        if current_size != self.target_size:
+            images = torch.nn.functional.interpolate(
+                images, 
+                size=self.target_size, 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        # Apply normalization directly
+        self.image_mean = self.image_mean.to(device)
+        self.image_std = self.image_std.to(device)
+        
+        # Check if normalization is needed (normalize from [0,1] or [-1,1] to model's expected range)
+        if images.min() < 0 or images.max() > 1:
+            # Assuming images are in range [-1, 1], convert to [0, 1]
+            images = (images + 1) / 2
+            
+        # Apply model's normalization
+        images = (images - self.image_mean) / self.image_std
+        
+        return images
+    
+    def prepare_text(self, text, device):
+        """Process text input"""
+        if isinstance(text, str):
+            text = [text]  # Convert single string to list for batch processing
+            
+        text_inputs = self.processor.tokenizer(
+            text, 
+            padding="max_length", 
+            max_length=self.processor.tokenizer.model_max_length, 
+            truncation=True,
+            return_tensors="pt"
+        ).to(device)
+        
+        return text_inputs
+    
+    def encode_input(self, images, text, device_map='cuda'):
+        """
+        Calculate cosine similarity between image and text embeddings
+        
+        Args:
+            images: Tensor of shape [batch, 3, height, width]
+            text: String or list of strings
+            device_map: Device to run the model on
+        
+        Returns:
+            Tuple of (image_embeds, text_embeds) - normalized embeddings
+        """
+        device = torch.device(device_map)
+        
+        # Process images directly as tensors
+        processed_images = self.prepare_images(images, device)
+        
+        # Process text
+        text_inputs = self.prepare_text(text, device)
+        
+        # Create model inputs
+        inputs = {
+            "pixel_values": processed_images,
+            "input_ids": text_inputs.input_ids,
+        }
+
+        # Add attention_mask if it exists
+        if "attention_mask" in text_inputs:
+            inputs["attention_mask"] = text_inputs["attention_mask"]
+        
+        # Run model inference
+        with torch.no_grad():
+            with torch.autocast(device_map):
+                outputs = self.model(**inputs)
+                
+        # Extract image and text embeddings from the model outputs
+        # For CLIP, the embeddings are directly available in the outputs
+        image_embeds = outputs.image_embeds
+        text_embeds = outputs.text_embeds
+        
+        # CLIP outputs are already normalized, but let's ensure they are
+        image_embeds = image_embeds / image_embeds.norm(dim=1, keepdim=True)
+        text_embeds = text_embeds / text_embeds.norm(dim=1, keepdim=True)
+        
+        return image_embeds, text_embeds
+    
+    def get_similarity(self, images, text, device_map='cuda'):
+        """
+        Calculate cosine similarity between image and text embeddings
+        
+        Args:
+            images: Tensor of shape [batch, 3, height, width]
+            text: String or list of strings
+            device_map: Device to run the model on
+        
+        Returns:
+            Tensor of cosine similarity scores
+        """
+        image_embeds, text_embeds = self.encode_input(images, text, device_map)
+        
+        # Calculate cosine similarity (since embeddings are normalized, this is just dot product)
+        similarity = torch.matmul(image_embeds, text_embeds.T)
+        
+        return similarity
+
+
+import torch
+import torch.nn as nn
+from transformers import AutoImageProcessor, AutoModel
+import torch.nn.functional as F
+
+class DINOVisionEncoder(nn.Module):
+    def __init__(self, model_name="facebook/dino-vitb16", delay_load=False):
+        """
+        DINO Vision Encoder for extracting visual features
+        
+        Args:
+            model_name: DINO model variant to use
+                - "facebook/dino-vitb16" (ViT-B/16)
+                - "facebook/dino-vits16" (ViT-S/16) 
+                - "facebook/dino-vitb8" (ViT-B/8)
+                - "facebook/dino-vits8" (ViT-S/8)
+            delay_load: Whether to delay model loading
+        """
+        super().__init__()
+        self.model_name = model_name
+        if not delay_load:
+            self.load_model()
+    
+    def load_model(self, device_map='cuda'):
+        """Load the DINO model and processor"""
+        self.model = AutoModel.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.float16,
+            device_map=device_map,
+        )
+        self.processor = AutoImageProcessor.from_pretrained(self.model_name)
+        
+        # Store normalization parameters for direct tensor processing
+        self.image_mean = torch.tensor(self.processor.image_mean).view(1, 3, 1, 1)
+        self.image_std = torch.tensor(self.processor.image_std).view(1, 3, 1, 1)
+        
+        # Get target image size
+        if hasattr(self.processor, 'size'):
+            if isinstance(self.processor.size, dict):
+                # Handle different size format variations
+                if 'shortest_edge' in self.processor.size:
+                    size = self.processor.size['shortest_edge']
+                elif 'height' in self.processor.size:
+                    size = self.processor.size['height']  # Assuming square
+                else:
+                    size = 224  # Default DINO size
+            else:
+                size = self.processor.size
+        else:
+            size = 224  # Default fallback
+            
+        self.target_size = (size, size)
+        
+        # Get the embedding dimension from the model config
+        self.embed_dim = self.model.config.hidden_size
+        
+    def prepare_images(self, images, device):
+        """Process image tensors directly without PIL conversion"""
+        # Ensure images are in the right format [batch, channels, height, width]
+        if images.dim() == 3:  # Single image [channels, height, width]
+            images = images.unsqueeze(0)
+            
+        # Resize if needed
+        current_size = images.shape[2:4]
+        if current_size != self.target_size:
+            images = F.interpolate(
+                images, 
+                size=self.target_size, 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        # Move normalization tensors to the correct device
+        self.image_mean = self.image_mean.to(device)
+        self.image_std = self.image_std.to(device)
+        
+        # Normalize pixel values to [0, 1] if they're not already
+        if images.min() < 0 or images.max() > 1:
+            # Assuming images are in range [-1, 1], convert to [0, 1]
+            images = (images + 1) / 2
+            
+        # Apply model's normalization (ImageNet stats)
+        images = (images - self.image_mean) / self.image_std
+        
+        return images
+    
+    def encode_images(self, images, device_map='cuda', return_patch_tokens=False):
+        """
+        Extract DINO features from images
+        
+        Args:
+            images: Tensor of shape [batch, 3, height, width]
+            device_map: Device to run the model on
+            return_patch_tokens: Whether to return patch tokens in addition to CLS token
+        
+        Returns:
+            If return_patch_tokens=False: Tensor of shape [batch, embed_dim] (CLS token features)
+            If return_patch_tokens=True: Tuple of (cls_features, patch_features)
+                - cls_features: [batch, embed_dim]
+                - patch_features: [batch, num_patches, embed_dim]
+        """
+        device = torch.device(device_map)
+        
+        # Process images
+        processed_images = self.prepare_images(images, device)
+        
+        # Run model inference
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type):
+                outputs = self.model(pixel_values=processed_images)
+        
+        # Extract features
+        # DINO outputs: last_hidden_state contains [CLS] token + patch tokens
+        # CLS token is at index 0
+        last_hidden_state = outputs.last_hidden_state  # [batch, seq_len, embed_dim]
+        
+        # Extract CLS token features (global image representation)
+        cls_features = last_hidden_state[:, 0, :]  # [batch, embed_dim]
+        
+        if return_patch_tokens:
+            # Extract patch token features (spatial features)
+            patch_features = last_hidden_state[:, 1:, :]  # [batch, num_patches, embed_dim]
+            return cls_features, patch_features
+        else:
+            return cls_features
+    
+    def get_similarity(self, images1, images2, device_map='cuda', similarity_type='cosine'):
+        """
+        Calculate similarity between two sets of images using DINO features
+        
+        Args:
+            images1: First set of images [batch1, 3, height, width]
+            images2: Second set of images [batch2, 3, height, width]
+            device_map: Device to run the model on
+            similarity_type: 'cosine' or 'euclidean'
+        
+        Returns:
+            Similarity matrix [batch1, batch2]
+        """
+        # Extract features for both image sets
+        features1 = self.encode_images(images1, device_map)
+        features2 = self.encode_images(images2, device_map)
+        
+        if similarity_type == 'cosine':
+            # Normalize features for cosine similarity
+            features1 = F.normalize(features1, dim=1)
+            features2 = F.normalize(features2, dim=1)
+            
+            # Cosine similarity via matrix multiplication
+            similarity = torch.matmul(features1, features2.T)
+            
+        elif similarity_type == 'euclidean':
+            # Compute pairwise euclidean distances
+            # Expand dimensions for broadcasting
+            features1_expanded = features1.unsqueeze(1)  # [batch1, 1, embed_dim]
+            features2_expanded = features2.unsqueeze(0)  # [1, batch2, embed_dim]
+            
+            # Calculate euclidean distance
+            distances = torch.norm(features1_expanded - features2_expanded, dim=2)
+            
+            # Convert distances to similarities (higher = more similar)
+            similarity = 1 / (1 + distances)
+            
+        else:
+            raise ValueError(f"Unknown similarity type: {similarity_type}")
+        
+        return similarity
+    
+    def extract_patch_features(self, images, device_map='cuda', layer_idx=-1):
+        """
+        Extract spatial patch features from a specific layer
+        Useful for dense prediction tasks or attention visualization
+        
+        Args:
+            images: Tensor of shape [batch, 3, height, width]
+            device_map: Device to run the model on
+            layer_idx: Which transformer layer to extract features from (-1 for last layer)
+        
+        Returns:
+            Patch features [batch, num_patches, embed_dim]
+        """
+        device = torch.device(device_map)
+        processed_images = self.prepare_images(images, device)
+        
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type):
+                if layer_idx == -1:
+                    # Use the standard forward pass for last layer
+                    outputs = self.model(pixel_values=processed_images)
+                    patch_features = outputs.last_hidden_state[:, 1:, :]
+                else:
+                    # Get intermediate layer outputs
+                    outputs = self.model(
+                        pixel_values=processed_images, 
+                        output_hidden_states=True
+                    )
+                    # hidden_states includes embedding layer + all transformer layers
+                    patch_features = outputs.hidden_states[layer_idx + 1][:, 1:, :]
+        
+        return patch_features
+    
+    def get_attention_maps(self, images, device_map='cuda', head_fusion='mean'):
+        """
+        Extract attention maps from DINO model
+        Useful for visualizing what the model is focusing on
+        
+        Args:
+            images: Tensor of shape [batch, 3, height, width]
+            device_map: Device to run the model on
+            head_fusion: How to combine attention heads ('mean', 'max', 'min')
+        
+        Returns:
+            Attention maps [batch, num_patches] (attention from CLS token to patches)
+        """
+        device = torch.device(device_map)
+        processed_images = self.prepare_images(images, device)
+        
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type):
+                outputs = self.model(
+                    pixel_values=processed_images, 
+                    output_attentions=True
+                )
+        
+        # Get attention weights from the last layer
+        # Shape: [batch, num_heads, seq_len, seq_len]
+        attention_weights = outputs.attentions[-1]
+        
+        # Extract attention from CLS token (index 0) to patch tokens
+        cls_attention = attention_weights[:, :, 0, 1:]  # [batch, num_heads, num_patches]
+        
+        # Fuse attention heads
+        if head_fusion == 'mean':
+            attention_maps = cls_attention.mean(dim=1)
+        elif head_fusion == 'max':
+            attention_maps = cls_attention.max(dim=1)[0]
+        elif head_fusion == 'min':
+            attention_maps = cls_attention.min(dim=1)[0]
+        else:
+            raise ValueError(f"Unknown head fusion method: {head_fusion}")
+        
+        return attention_maps
